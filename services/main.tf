@@ -145,11 +145,15 @@ module "api_gateway" {
     }
     "POST /votes" = {
       integration = {
-        uri    = module.post-votes.lambda_function_invoke_arn
-        type   = "AWS_PROXY"
-        method = "POST"
+        description     = "integrate with Vote SQS queue"
+        type            = "AWS_PROXY"
+        subtype         = "SQS-SendMessage"
+        credentials_arn = aws_iam_role.apigw_sqs_role.arn
 
-        payload_format_version = "2.0"
+        request_parameters = {
+          "QueueUrl"    = module.votes_queue.queue_id
+          "MessageBody" = "$request.body"
+        }
       }
     }
 }
@@ -167,6 +171,122 @@ module "api_gateway" {
 # Module 3 - Aync Writes
 # ---------------------------------------------------------
 
+resource "aws_iam_role" "apigw_sqs_role" {
+  name = "${var.app_name}-apigw_sqs_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "apigateway.amazonaws.com"
+        }
+      },
+    ]
+  })
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+}
+
+resource "aws_iam_role_policy" "sqs_integration" {
+  name = "sqs_integration_policy"
+  role = aws_iam_role.apigw_sqs_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "sqs:SendMessage",
+          "sqs:SendMessageBatch"
+        ]
+        Effect   = "Allow"
+        Resource = module.votes_queue.queue_arn
+      },
+    ]
+  })
+}
+
+module "votes_queue" {
+  source = "terraform-aws-modules/sqs/aws"
+
+  name = "${var.app_name}-votes-queue"
+
+  tags = {
+    Service     = "user"
+    Environment = "dev"
+  }
+}
+
+module "count-votes" {
+  source = "terraform-aws-modules/lambda/aws"
+
+  function_name   = "${var.app_name}-count-votes"
+  description     = "batch couting function"
+  handler         = "index.handler"
+  runtime         = "nodejs18.x"
+  memory_size     = 256
+  build_in_docker = true
+
+  source_path = "src/count-votes"
+
+  environment_variables = {
+    QUEUE_URL = module.votes_queue.queue_id
+    DDB_TABLE_NAME = aws_dynamodb_table.votes_table.id
+  }
+
+  event_source_mapping = {
+    sqs = {
+      event_source_arn                   = module.votes_queue.queue_arn
+      batch_size                         = 1000
+      maximum_batching_window_in_seconds = 1
+    }
+  }
+
+  allowed_triggers = {
+    sqs = {
+      principal  = "sqs.amazonaws.com"
+      source_arn = module.votes_queue.queue_arn
+    }
+  }
+
+  create_current_version_allowed_triggers = false
+
+  tracing_mode          = "Active"
+  attach_tracing_policy = true
+
+  attach_policies    = true
+  number_of_policies = 1
+
+  policies = [
+    "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+  ]
+
+  attach_policy_statements = true
+  policy_statements = {
+    dynamodb = {
+      effect = "Allow",
+      actions = [
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:ConditionCheckItem"
+      ],
+      resources = [aws_dynamodb_table.votes_table.arn]
+    }
+  }
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+}
 
 
 # ---------------------------------------------------------
