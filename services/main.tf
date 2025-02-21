@@ -22,6 +22,10 @@ resource "aws_dynamodb_table" "votes_table" {
     type = "S"
   }
 
+  # enable dynamodb streaming 
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
+
   tags = {
     Terraform   = "true"
     Environment = "dev"
@@ -294,3 +298,181 @@ module "count-votes" {
 # ---------------------------------------------------------
 
 
+# ---------------------------------------------------------
+# Module 4 - Realtime Updates
+# ---------------------------------------------------------
+
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+data "aws_iot_endpoint" "current" {
+  endpoint_type = "iot:Data-ATS"
+}
+
+module "realtime-update" {
+  source = "terraform-aws-modules/lambda/aws"
+
+  function_name   = "${var.app_name}-realtime-update"
+  description     = "realtime update function"
+  handler         = "index.handler"
+  runtime         = "nodejs18.x"
+  memory_size     = 256
+  build_in_docker = true
+
+  source_path = "src/realtime-update"
+
+  environment_variables = {
+    IOT_ENDPOINT = data.aws_iot_endpoint.current.endpoint_address
+  }
+
+  event_source_mapping = {
+    dynamodb = {
+      event_source_arn  = aws_dynamodb_table.votes_table.stream_arn
+      starting_position = "LATEST"
+    }
+  }
+
+  allowed_triggers = {
+    dynamodb = {
+      principal  = "dynamodb.amazonaws.com"
+      source_arn = aws_dynamodb_table.votes_table.stream_arn
+    }
+  }
+
+  create_current_version_allowed_triggers = false
+
+  tracing_mode          = "Active"
+  attach_tracing_policy = true
+
+  attach_policies    = true
+  number_of_policies = 1
+
+  policies = [
+    "arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole",
+  ]
+
+  attach_policy_statements = true
+  policy_statements = {
+    iotcore = {
+      effect = "Allow",
+      actions = [
+        "iot:Publish",
+      ],
+      resources = ["arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/votes"]
+    }
+  }
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+
+}
+
+resource "aws_cognito_identity_pool" "main" {
+  identity_pool_name               = "${var.app_name}-identity_pool"
+  allow_unauthenticated_identities = true
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+}
+
+resource "aws_iam_role" "unauthenticated" {
+  name = "${var.app_name}-cognito_poolUnauth_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        "Effect" : "Allow",
+        "Principal" : {
+          "Federated" : "cognito-identity.amazonaws.com"
+        },
+        "Action" : "sts:AssumeRoleWithWebIdentity",
+        "Condition" : {
+          "StringEquals" : {
+            "cognito-identity.amazonaws.com:aud" : "${aws_cognito_identity_pool.main.id}"
+          },
+          "ForAnyValue:StringLike" : {
+            "cognito-identity.amazonaws.com:amr" : "unauthenticated"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+}
+
+resource "aws_iam_role_policy" "unauthenticated_policy" {
+  name = "cognito_iot_unauthenticated_policy"
+  role = aws_iam_role.unauthenticated.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action   = ["iot:Connect"]
+        Effect   = "Allow"
+        Resource = ["arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/*"]
+      },
+      {
+        Action   = ["iot:Receive"]
+        Effect   = "Allow"
+        Resource = ["arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/votes"]
+      },
+      {
+        Action   = ["iot:Subscribe"]
+        Effect   = "Allow"
+        Resource = ["arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topicfilter/votes"]
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role" "authenticated" {
+  name = "${var.app_name}-cognito_poolAuth_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        "Effect" : "Allow",
+        "Principal" : {
+          "Federated" : "cognito-identity.amazonaws.com"
+        },
+        "Action" : "sts:AssumeRoleWithWebIdentity",
+        "Condition" : {
+          "StringEquals" : {
+            "cognito-identity.amazonaws.com:aud" : "${aws_cognito_identity_pool.main.id}"
+          },
+          "ForAnyValue:StringLike" : {
+            "cognito-identity.amazonaws.com:amr" : "authenticated"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Terraform   = "true"
+    Environment = "dev"
+    Application = var.app_name
+  }
+}
+
+resource "aws_cognito_identity_pool_roles_attachment" "main" {
+  identity_pool_id = aws_cognito_identity_pool.main.id
+
+  roles = {
+    "unauthenticated" = aws_iam_role.unauthenticated.arn
+    "authenticated"   = aws_iam_role.authenticated.arn
+  }
+}
